@@ -130,6 +130,19 @@ func (a *Activities) MarkRequestTerminated(ctx context.Context, requestID string
 	return nil
 }
 
+func (a *Activities) UpdatePolicyStatus(ctx context.Context, policyNumber string, status string) error {
+	activity.GetLogger(ctx).Info("Updating policy status", "policy", policyNumber, "status", status)
+	// In prototype, don't change policy struct; in real system update DB
+	// For now, just log it
+	return nil
+}
+
+func (a *Activities) MarkRequestCompleted(ctx context.Context, requestID string) error {
+	activity.GetLogger(ctx).Info("Mark request completed", "request", requestID)
+	_ = a.Store.UpdateRequestStatus(requestID, "COMPLETED")
+	return nil
+}
+
 // helper
 func almostEqual(a, b float64) bool {
 	if a == b {

@@ -9,110 +9,186 @@ import (
 	"revival/internal/store"
 )
 
-// Note: Use activity names matching registered Activity methods
+// RevivalParentWorkflow implements the parent workflow as per flow.mmd
+// This workflow handles the complete revival request lifecycle from indexing to completion
 func RevivalParentWorkflow(ctx workflow.Context, requestID string) error {
+	logger := workflow.GetLogger(ctx)
+	logger.Info("Starting Revival Parent Workflow", "requestID", requestID)
 
-	 ao := workflow.ActivityOptions{
-        StartToCloseTimeout: time.Minute * 5,
-        RetryPolicy: &temporal.RetryPolicy{
-            InitialInterval: time.Second * 2,
-            BackoffCoefficient: 2.0,
-            MaximumAttempts: 3,
-        },
-    }
-    ctx = workflow.WithActivityOptions(ctx, ao)
-	// load request and policy
+	// Configure activity options
+	ao := workflow.ActivityOptions{
+		StartToCloseTimeout: time.Minute * 5,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    time.Second * 2,
+			BackoffCoefficient: 2.0,
+			MaximumAttempts:    3,
+		},
+	}
+	ctx = workflow.WithActivityOptions(ctx, ao)
+
+	// ========== STEP 1: Load Revival Request and Policy ==========
+	// Index Revival Request (IR_2) - Load data
 	var req store.RevivalRequest
 	var pol store.Policy
 
-	// Activities to load request and policy
-	if err := workflow.ExecuteActivity(ctx, "Activities.LoadRevivalRequest", requestID).Get(ctx, &req); err != nil {
-		return err
-	}
-	if err := workflow.ExecuteActivity(ctx, "Activities.LoadPolicy", req.PolicyNumber).Get(ctx, &pol); err != nil {
+	if err := workflow.ExecuteActivity(ctx, "LoadRevivalRequest", requestID).Get(ctx, &req); err != nil {
+		logger.Error("Failed to load revival request", "error", err)
 		return err
 	}
 
-	// 1) Maturity check
-	if pol.MaturityDate != nil {
-		if workflow.Now(ctx).After(*pol.MaturityDate) {
-			workflow.ExecuteActivity(ctx, "Activities.MarkRevivalNotPermitted", requestID, "MaturityReached")
-			return nil
-		}
+	if err := workflow.ExecuteActivity(ctx, "LoadPolicy", req.PolicyNumber).Get(ctx, &pol); err != nil {
+		logger.Error("Failed to load policy", "error", err)
+		return err
 	}
 
-	// 2) 5-year check: first unpaid is LastPaidToDate + 1 month
-	firstUnpaid := pol.LastPaidToDate.AddDate(0, 1, 0)
-	if workflow.Now(ctx).Sub(firstUnpaid).Hours() > (24.0 * 365.0 * 5.0) {
-		workflow.ExecuteActivity(ctx, "Activities.MarkRevivalNotPermitted", requestID, "Beyond5Years")
+	logger.Info("Loaded request and policy", "policyNumber", req.PolicyNumber)
+
+	// ========== STEP 2: Pre-checks - Maturity Date (Rule 58) ==========
+	// Check: Has Policy Reached Maturity Date?
+	if pol.MaturityDate != nil && workflow.Now(ctx).After(*pol.MaturityDate) {
+		logger.Info("Revival not permitted - policy has reached maturity date")
+		workflow.ExecuteActivity(ctx, "MarkRevivalNotPermitted", requestID, "MaturityReached")
+		return nil // END: Revival Not Permitted (Maturity Reached)
+	}
+
+	// ========== STEP 3: Pre-checks - 5 Years from First Unpaid Premium (Rule 58(1)) ==========
+	// Check: Within 5 Years from First Unpaid Premium?
+	firstUnpaidDate := pol.LastPaidToDate.AddDate(0, 1, 0) // First unpaid is 1 month after last paid
+	fiveYearsLimit := firstUnpaidDate.AddDate(5, 0, 0)
+
+	if workflow.Now(ctx).After(fiveYearsLimit) {
+		logger.Info("Revival not permitted - beyond 5 years from first unpaid premium")
+		workflow.ExecuteActivity(ctx, "MarkRevivalNotPermitted", requestID, "Beyond5Years")
+		return nil // END: Revival Not Permitted (Beyond 5 Years)
+	}
+
+	// ========== STEP 4: Data Entry and QC Verification ==========
+	logger.Info("Performing data entry and QC verification")
+	if err := workflow.ExecuteActivity(ctx, "PerformDataEntryAndQC", requestID).Get(ctx, nil); err != nil {
+		logger.Error("Data entry and QC failed", "error", err)
+		return err
+	}
+
+	// ========== STEP 5: Approver Review ==========
+	logger.Info("Sending request for approval")
+	var approvalResult string
+	if err := workflow.ExecuteActivity(ctx, "PerformApproval", requestID).Get(ctx, &approvalResult); err != nil {
+		logger.Error("Approval activity failed", "error", err)
+		return err
+	}
+
+	// Handle approval decision
+	if approvalResult == "REJECTED" {
+		logger.Info("Request rejected by approver")
+		workflow.ExecuteActivity(ctx, "GenerateLetter", requestID, "REJECTION")
+		workflow.ExecuteActivity(ctx, "MarkRequestTerminated", requestID, "Rejected")
+		return nil // END: Request Rejected
+	} else if approvalResult == "WITHDRAWN" {
+		logger.Info("Request withdrawn")
+		workflow.ExecuteActivity(ctx, "MarkRequestTerminated", requestID, "Withdrawn")
+		return nil // END: Request Withdrawn (IR_35)
+	} else if approvalResult != "APPROVED" {
+		logger.Warn("Unexpected approval result", "result", approvalResult)
+		workflow.ExecuteActivity(ctx, "MarkRequestTerminated", requestID, "UnexpectedApprovalResult")
 		return nil
 	}
 
-	// Data entry & QC
-	if err := workflow.ExecuteActivity(ctx, "Activities.PerformDataEntryAndQC", requestID).Get(ctx, nil); err != nil {
-		return err
-	}
+	// ========== STEP 6: Generate Acceptance Letter (IR_25) ==========
+	logger.Info("Request approved - generating acceptance letter")
+	workflow.ExecuteActivity(ctx, "GenerateLetter", requestID, "ACCEPTANCE")
 
-	// Approver (simplified as activity)
-	var approval string
-	if err := workflow.ExecuteActivity(ctx, "Activities.PerformApproval", requestID).Get(ctx, &approval); err != nil {
-		return err
-	}
-	if approval != "APPROVED" {
-		workflow.ExecuteActivity(ctx, "Activities.MarkRequestTerminated", requestID, "Rejected")
-		return nil
-	}
+	// ========== STEP 7: Start 60-Day SLA Timer (IR_10) ==========
+	// Wait for FirstInstallmentPaid signal with 60-day timeout
+	logger.Info("Starting 60-day SLA timer for first installment payment")
+	slaTimer := workflow.NewTimer(ctx, 60*24*time.Hour)
+	firstInstallmentChannel := workflow.GetSignalChannel(ctx, "FirstInstallmentPaid")
 
-	// Generate acceptance letter
-	workflow.ExecuteActivity(ctx, "Activities.GenerateLetter", requestID, "ACCEPTANCE")
-
-	// Start SLA timer for first installment - 60 days
-	sla := workflow.NewTimer(ctx, 60*24*time.Hour)
-	firstCh := workflow.GetSignalChannel(ctx, "FirstInstallmentPaid")
-	var signalData map[string]interface{}
-	var gotFirst bool
+	var firstInstallmentPayload map[string]interface{}
+	var receivedFirstInstallment bool
 
 	selector := workflow.NewSelector(ctx)
-	selector.AddReceive(firstCh, func(c workflow.ReceiveChannel, more bool) {
-		c.Receive(ctx, &signalData)
-		gotFirst = true
-	})
-	selector.AddFuture(sla, func(f workflow.Future) {
-		// timer expired
+
+	// Add receiver for FirstInstallmentPaid signal
+	selector.AddReceive(firstInstallmentChannel, func(c workflow.ReceiveChannel, more bool) {
+		c.Receive(ctx, &firstInstallmentPayload)
+		receivedFirstInstallment = true
+		logger.Info("Received FirstInstallmentPaid signal")
 	})
 
+	// Add timer expiry handler
+	selector.AddFuture(slaTimer, func(f workflow.Future) {
+		logger.Info("60-day SLA timer expired")
+	})
+
+	// Wait for either signal or timer
 	selector.Select(ctx)
 
-	if !gotFirst {
-		workflow.ExecuteActivity(ctx, "Activities.MarkRequestTerminated", requestID, "SLAExpired")
-		return nil
+	// Check if timer expired without receiving payment
+	if !receivedFirstInstallment {
+		logger.Info("Request terminated - SLA expired without payment")
+		workflow.ExecuteActivity(ctx, "MarkRequestTerminated", requestID, "SLAExpired")
+		return nil // END: Request Terminated (SLA Expired)
 	}
 
-	// Process first installment
-	workflow.ExecuteActivity(ctx, "Activities.ProcessFirstInstallment", requestID, signalData)
-
-	// Generate revival memo, update policy status
-	workflow.ExecuteActivity(ctx, "Activities.GenerateLetter", requestID, "REVIVAL_MEMO")
-	workflow.ExecuteActivity(ctx, "Activities.UpdatePolicyStatus", req.PolicyNumber, "AP")
-
-	// Start child workflow: remaining installments = req.NoOfInstallments - 1
-	childFuture := workflow.ExecuteChildWorkflow(ctx, InstallmentMonitorWorkflow, req.PolicyNumber, requestID, req.NoOfInstallments-1)
-	var childResult string
-	if err := childFuture.Get(ctx, &childResult); err != nil {
-		workflow.ExecuteActivity(ctx, "Activities.MarkRequestTerminated", requestID, "ChildFailure")
+	// ========== STEP 8: Process First Installment Payment ==========
+	logger.Info("Processing first installment payment")
+	if err := workflow.ExecuteActivity(ctx, "ProcessFirstInstallment", requestID, firstInstallmentPayload).Get(ctx, nil); err != nil {
+		logger.Error("Failed to process first installment", "error", err)
 		return err
 	}
+
+	// ========== STEP 9: Generate Revival Memo (IR_25) ==========
+	logger.Info("Generating revival memo")
+	workflow.ExecuteActivity(ctx, "GenerateLetter", requestID, "REVIVAL_MEMO")
+
+	// ========== STEP 10: Update Policy Status to AP (IR_13) ==========
+	logger.Info("Updating policy status to AP (Active Premium)")
+	workflow.ExecuteActivity(ctx, "UpdatePolicyStatus", req.PolicyNumber, "AP")
+
+	// ========== STEP 11: Start Child Workflow - Installment Monitor ==========
+	// Calculate remaining installments (total - 1 for first already paid)
+	remainingInstallments := req.NoOfInstallments - 1
+	logger.Info("Starting child workflow for installment monitoring", "remainingInstallments", remainingInstallments)
+
+	// Configure child workflow options
+	childOptions := workflow.ChildWorkflowOptions{
+		WorkflowID: "installment-monitor-" + requestID,
+		TaskQueue:  "revival-task-queue",
+	}
+	childCtx := workflow.WithChildOptions(ctx, childOptions)
+
+	// Execute child workflow
+	childFuture := workflow.ExecuteChildWorkflow(childCtx, InstallmentMonitorWorkflow, req.PolicyNumber, requestID, remainingInstallments)
+
+	var childResult string
+	if err := childFuture.Get(ctx, &childResult); err != nil {
+		logger.Error("Child workflow failed", "error", err)
+		workflow.ExecuteActivity(ctx, "MarkRequestTerminated", requestID, "ChildWorkflowFailed")
+		return err
+	}
+
+	// ========== STEP 12: Handle Child Workflow Result ==========
+	logger.Info("Child workflow completed", "result", childResult)
 
 	switch childResult {
 	case "SUCCESS":
-		workflow.ExecuteActivity(ctx, "Activities.GenerateLetter", requestID, "COMPLETION")
-		workflow.ExecuteActivity(ctx, "Activities.MarkRequestTerminated", requestID, "COMPLETED")
-	case "DEFAULT":
-		workflow.ExecuteActivity(ctx, "Activities.MarkPolicyLapsed", req.PolicyNumber)
-		workflow.ExecuteActivity(ctx, "Activities.MoveCollectionsToSuspense", req.PolicyNumber)
-	default:
-		workflow.ExecuteActivity(ctx, "Activities.MarkRequestTerminated", requestID, childResult)
-	}
+		// All installments paid successfully (IR_15)
+		logger.Info("Revival completed successfully - all installments paid")
+		workflow.ExecuteActivity(ctx, "GenerateLetter", requestID, "COMPLETION")
+		workflow.ExecuteActivity(ctx, "MarkRequestCompleted", requestID)
+		return nil // END: Revival Successful
 
-	return nil
+	case "DEFAULT":
+		// Installment payment defaulted (IR_16)
+		logger.Info("Installment payment defaulted - marking policy as lapsed")
+		workflow.ExecuteActivity(ctx, "MarkPolicyLapsed", req.PolicyNumber)
+		workflow.ExecuteActivity(ctx, "MoveCollectionsToSuspense", req.PolicyNumber)
+		return nil // END: Policy Lapsed (moved to suspense IR_24)
+
+	default:
+		// Unexpected result or termination
+		logger.Warn("Child workflow returned unexpected result", "result", childResult)
+		workflow.ExecuteActivity(ctx, "MarkRequestTerminated", requestID, childResult)
+		return nil // END: Request Terminated
+	}
 }
