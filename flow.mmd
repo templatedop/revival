@@ -1,0 +1,59 @@
+flowchart TD
+
+%% ========== PARENT WORKFLOW ==========
+subgraph PARENT["Parent Workflow – Revival Request Lifecycle"]
+    A["Index Revival Request (IR_2)"] --> B{"Has Policy Reached Maturity Date?"}
+    B -->|Yes| B1["Revival Not Permitted – Policy Term Ended (Rule 58)"]
+    B -->|No| C{"Within 5 Years from First Unpaid Premium?"}
+    C -->|No| C1["Revival Not Permitted – Beyond 5 Years (Rule 58(1))"]
+    C -->|Yes| D["Data Entry and QC Verification"]
+
+    D --> E["Approver Review"]
+    E -->|Approved| F["Generate Acceptance Letter (IR_25)"]
+    E -->|Rejected| R1["Reinstatement Rejection Letter"]
+    R1 --> R2["Policy = AL, Request Rejected"]
+
+    F --> G["Start 60-Day SLA Timer (IR_10)"]
+    G -->|Timer Expired| G1["Request Terminated, Policy AL"]
+    G -->|Signal First Installment Paid| H["Generate Revival Memo (IR_25)"]
+    H --> I["Policy Status = AP (IR_13)"]
+    I --> J["Start Child Workflow: Installment Monitor"]
+
+    J -->|Child Success| P1["Revival Completed, Policy Active"]
+    J -->|Child Default| P2["Policy = AL, Move to Suspense (IR_16)"]
+    J -->|Child Terminated| P3["Request Terminated, Policy AL"]
+
+    E -->|Withdrawn| X1["Request Withdrawn (IR_35)"]
+    E -->|Missing Docs| X2["Returned to QC (Redirect Flow)"]
+end
+
+%% ========== CHILD WORKFLOW ==========
+subgraph CHILD["Child Workflow – Installment Payment and Monitoring"]
+    J1["Wait for Next Installment Due Date (Timer – 1st of each month)"] --> J2{"Installment Paid?"}
+    J2 -->|Yes| J3["Record Payment in DB, Update Paid Count, Continue"]
+    J2 -->|No| J4["Trigger Default (IR_16)"]
+    J4 --> J5["Policy = AL, Move Collections to Suspense (IR_24)"]
+    J3 -->|All Paid| J6["Return SUCCESS to Parent (IR_15)"]
+    J4 -->|Default| J7["Return DEFAULT to Parent"]
+end
+
+%% ========== END STATES ==========
+B1 -.-> END1["Parent Ends: Revival Not Permitted (Maturity Reached)"]
+C1 -.-> END2["Parent Ends: Revival Not Permitted (Beyond 5 Years)"]
+G1 -.-> END3["Parent Ends: Terminated (SLA Expired)"]
+P1 -.-> END4["Parent Ends: Revival Successful"]
+P2 -.-> END5["Parent Ends: Policy Lapsed"]
+P3 -.-> END6["Parent Ends: Terminated"]
+R2 -.-> END7["Parent Ends: Rejected"]
+X1 -.-> END8["Parent Ends: Withdrawn"]
+
+%% ========== STYLING ==========
+classDef decision fill:#fef6e4,stroke:#ff9900,stroke-width:2px;
+classDef activity fill:#eaffea,stroke:#2ecc71,stroke-width:1.5px;
+classDef timer fill:#fff2cc,stroke:#ffcc00,stroke-width:2px;
+classDef state fill:#fff,stroke:#bbb,stroke-width:1px;
+
+class B,C,J2 decision;
+class A,D,E,F,G,H,I,J,J1,J3,J4,J5,J6,J7 activity;
+class G,J1 timer;
+class B1,C1,G1,P1,P2,P3,R1,R2,X1,X2 state;
