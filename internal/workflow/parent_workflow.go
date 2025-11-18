@@ -62,6 +62,32 @@ func RevivalParentWorkflow(ctx workflow.Context, requestID string) error {
 		return nil // END: Revival Not Permitted (Beyond 5 Years)
 	}
 
+	// ========== STEP 3A: Check Maximum Revivals (IR_29) ==========
+	// SRS Rule IR_29: Maximum 2 revivals allowed per policy
+	if pol.RevivalCount >= 2 {
+		logger.Info("Revival not permitted - maximum 2 revivals already exhausted", "revivalCount", pol.RevivalCount)
+		workflow.ExecuteActivity(ctx, "MarkRevivalNotPermitted", requestID, "MaxRevivalsExceeded")
+		return nil // END: Revival Not Permitted (Max 2 Revivals)
+	}
+
+	// ========== STEP 3B: Validate Installment Count (IR_3, IR_4) ==========
+	// SRS Rule IR_3: Minimum 2 installments
+	// SRS Rule IR_4: Maximum 12 installments
+	if req.NoOfInstallments < 2 {
+		logger.Error("Invalid installment count - minimum is 2", "requested", req.NoOfInstallments)
+		workflow.ExecuteActivity(ctx, "MarkRevivalNotPermitted", requestID, "InstallmentsBelowMinimum")
+		return nil
+	}
+	if req.NoOfInstallments > 12 {
+		logger.Error("Invalid installment count - maximum is 12", "requested", req.NoOfInstallments)
+		workflow.ExecuteActivity(ctx, "MarkRevivalNotPermitted", requestID, "InstallmentsExceedMaximum")
+		return nil
+	}
+
+	logger.Info("Pre-checks passed",
+		"revivalCount", pol.RevivalCount,
+		"requestedInstallments", req.NoOfInstallments)
+
 	// ========== STEP 4: Data Entry and QC Verification ==========
 	logger.Info("Performing data entry and QC verification")
 	if err := workflow.ExecuteActivity(ctx, "PerformDataEntryAndQC", requestID).Get(ctx, nil); err != nil {
@@ -82,14 +108,19 @@ func RevivalParentWorkflow(ctx workflow.Context, requestID string) error {
 		logger.Info("Request rejected by approver")
 		workflow.ExecuteActivity(ctx, "GenerateLetter", requestID, "REJECTION")
 		workflow.ExecuteActivity(ctx, "MarkRequestTerminated", requestID, "Rejected")
+		// Sankalan Rule 58(3): Refund amount if not approved
+		workflow.ExecuteActivity(ctx, "ProcessRefund", requestID, "Rejected")
 		return nil // END: Request Rejected
 	} else if approvalResult == "WITHDRAWN" {
 		logger.Info("Request withdrawn")
 		workflow.ExecuteActivity(ctx, "MarkRequestTerminated", requestID, "Withdrawn")
+		// Sankalan Rule 58(3): Refund amount if withdrawn
+		workflow.ExecuteActivity(ctx, "ProcessRefund", requestID, "Withdrawn")
 		return nil // END: Request Withdrawn (IR_35)
 	} else if approvalResult != "APPROVED" {
 		logger.Warn("Unexpected approval result", "result", approvalResult)
 		workflow.ExecuteActivity(ctx, "MarkRequestTerminated", requestID, "UnexpectedApprovalResult")
+		workflow.ExecuteActivity(ctx, "ProcessRefund", requestID, "UnexpectedApprovalResult")
 		return nil
 	}
 
@@ -127,6 +158,8 @@ func RevivalParentWorkflow(ctx workflow.Context, requestID string) error {
 	if !receivedFirstInstallment {
 		logger.Info("Request terminated - SLA expired without payment")
 		workflow.ExecuteActivity(ctx, "MarkRequestTerminated", requestID, "SLAExpired")
+		// Sankalan Rule 58(3): Refund any advance payments if SLA expired
+		workflow.ExecuteActivity(ctx, "ProcessRefund", requestID, "SLAExpired")
 		return nil // END: Request Terminated (SLA Expired)
 	}
 
@@ -176,6 +209,9 @@ func RevivalParentWorkflow(ctx workflow.Context, requestID string) error {
 		logger.Info("Revival completed successfully - all installments paid")
 		workflow.ExecuteActivity(ctx, "GenerateLetter", requestID, "COMPLETION")
 		workflow.ExecuteActivity(ctx, "MarkRequestCompleted", requestID)
+		// SRS IR_29: Increment revival count (max 2 allowed)
+		workflow.ExecuteActivity(ctx, "IncrementRevivalCount", req.PolicyNumber)
+		logger.Info("Revival workflow completed successfully", "policyNumber", req.PolicyNumber)
 		return nil // END: Revival Successful
 
 	case "DEFAULT":

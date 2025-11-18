@@ -143,6 +143,56 @@ func (a *Activities) MarkRequestCompleted(ctx context.Context, requestID string)
 	return nil
 }
 
+// ProcessRefund handles refund of amounts when revival is not approved or death before approval
+// Implements Sankalan Rule 58(3): Amount refunded (with interest) if revival not approved
+func (a *Activities) ProcessRefund(ctx context.Context, requestID string, reason string) error {
+	logger := activity.GetLogger(ctx)
+	logger.Info("Processing refund for revival request", "request", requestID, "reason", reason)
+
+	// Get all payments made for this request
+	payments := a.Store.GetPaymentsByRequest(requestID)
+	if len(payments) == 0 {
+		logger.Info("No payments to refund")
+		return nil
+	}
+
+	// Calculate total amount to refund
+	var totalAmount float64
+	for _, payment := range payments {
+		totalAmount += payment.Amount
+		logger.Info("Payment to be refunded",
+			"receiptID", payment.ReceiptID,
+			"amount", payment.Amount,
+			"paidAt", payment.When)
+	}
+
+	// In production:
+	// 1. Calculate interest on refund amount
+	// 2. Create refund transaction in accounting system
+	// 3. Update suspense accounts
+	// 4. Generate refund letter/advice
+	// 5. Process actual refund through payment gateway
+
+	logger.Info("Refund processed successfully",
+		"totalAmount", totalAmount,
+		"paymentCount", len(payments),
+		"reason", reason)
+
+	// For prototype, just log the refund
+	return nil
+}
+
+// IncrementRevivalCount increments the revival count for a policy after successful revival
+// Tracks revival history per SRS IR_29 (max 2 revivals)
+func (a *Activities) IncrementRevivalCount(ctx context.Context, policyNumber string) error {
+	logger := activity.GetLogger(ctx)
+	logger.Info("Incrementing revival count", "policy", policyNumber)
+
+	// In production: UPDATE policies SET revival_count = revival_count + 1 WHERE policy_number = ?
+	// For prototype, just log
+	return nil
+}
+
 // helper
 func almostEqual(a, b float64) bool {
 	if a == b {
