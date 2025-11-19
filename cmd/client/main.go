@@ -54,32 +54,33 @@ func main() {
 	time.Sleep(3 * time.Second)
 
 	// Send first installment payment signal
+	// Note: Actual amounts calculated by system based on 13 unpaid months
 	fmt.Println("Simulating first installment payment...")
 	err = c.SignalWorkflow(context.Background(), we.GetID(), we.GetRunID(), "FirstInstallmentPaid", map[string]interface{}{
-		"amount":  9363.00,
+		"amount":  24348.55,
 		"receipt": "RCPT-FIRST-001",
 	})
 	if err != nil {
 		log.Fatalln("Failed to send FirstInstallmentPaid signal:", err)
 	}
-	fmt.Printf("✓ Sent FirstInstallmentPaid signal (Amount: ₹9,363.00)\n")
+	fmt.Printf("✓ Sent FirstInstallmentPaid signal (Amount: ₹24,348.55)\n")
 	fmt.Println("  - Processing first installment")
 	fmt.Println("  - Generating revival memo")
 	fmt.Println("  - Updating policy status to AP (Active Premium)")
 	fmt.Println("  - Starting child workflow for remaining 4 installments")
 	fmt.Println()
 
-	// Simulate subsequent installment payments
+	// Simulate subsequent installment payments (13 unpaid months scenario)
 	installments := []struct {
 		number  int
 		amount  float64
 		receipt string
 		delay   time.Duration
 	}{
-		{2, 8572.89, "RCPT-002", 3 * time.Second},
-		{3, 8572.89, "RCPT-003", 2 * time.Second},
-		{4, 8572.89, "RCPT-004", 2 * time.Second},
-		{5, 8572.89, "RCPT-005", 2 * time.Second},
+		{2, 22636.84, "RCPT-002", 3 * time.Second},
+		{3, 22636.84, "RCPT-003", 2 * time.Second},
+		{4, 22636.84, "RCPT-004", 2 * time.Second},
+		{5, 22636.84, "RCPT-005", 2 * time.Second},
 	}
 
 	for _, inst := range installments {
